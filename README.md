@@ -1,73 +1,91 @@
-# 콩 입모율 분석 파이프라인
+# 콩 입모율·파종기 효율성 분석 파이프라인
 
-13.8 GB 드론 정사영상에서 5개 필지(GJSM-1-1 ~ GJSM-2-3)의 콩 입모율·결주·간격 적합도를 산출한다.
-GJSM-1-1은 위/아래 파종기(일반 국내 vs 스마트 파종기 실증) 비교까지 수행한다.
+새만금 간척지 5.25mm GSD 드론 정사영상 기반. **두둑 검출 → 두둑별 dual-row 검출 → 줄 내 파종 간격 → 시각화 → 파종기 비교 리포트** 5단계 파이프라인.
 
-## 입력 데이터
+## 최종 목적
+
+1. **파종기 효율성 비교**: 파종 간격 균일성(CV), 결주율, 입모율 정량 비교 (스마트 vs 일반)
+2. **정밀농업 모니터링 알고리즘**: 드론/위성 RGB → 발아 잎 검출 → 파종 간격·결주율 자동 산출
+
+## 폴더 구조
 
 ```
-data/      간척지 초고해상도 정사영상-orthomosaic.tiff   # 13.8 GB, EPSG:32652, GSD 5.25mm
-shapefile/ GJSM-{1-1, 1-2, 1-3, 2-2, 2-3}_Boundary.zip   # EPSG:4326 단일 폴리곤
+data/           간척지 초고해상도 정사영상-orthomosaic.tiff  # 13.8GB, EPSG:32652, 5.25mm GSD
+shapefile/      GJSM-{1-1,1-2,1-3,2-2,2-3}_Boundary.zip     # 5필지 폴리곤 (EPSG:4326)
+scripts/
+  01_crop_fields.py                # 정사영상 → 필지 TIF crop
+  sam_run_field_full.py            # SAM으로 콩잎 검출 → npz 저장
+  run_pipeline.py                  # 통합 실행기
+  pipeline/
+    common.py                      # 공통 유틸 (좌표, 경로)
+    step1_ridges.py                # 두둑 검출 (gray 밴드패스 + SAM 결합)
+    step2_rows.py                  # 두둑별 dual-row 검출 + 조간
+    step3_spacing.py               # 줄 내 파종 간격 + 결주
+    step4_visualize.py             # 필지 overview + 두둑별 그리드
+    step5_seeder_compare.py        # 파종기 A/B 비교 리포트
+    _verify_step1_crop.py          # (검증) Step 1 crop 3장 확인
+result/
+  fields/                          # 필지별 TIF (SAM 입력)
+  sam_leaves/                      # SAM 콩잎 검출 npz (파이프라인 입력)
+  pipeline/{field}/                # step1~4 산출 (npz + PNG)
+  report/                          # step5 파종기 비교 (PNG, CSV, MD)
 ```
 
-## 실행 순서
+## 실행
+
+### 한 필지 처리 (SAM → step1~4)
 
 ```bash
-# 한번에 (권장, 약 80분)
-python -u scripts/run_all.py
-
-# 또는 단계별
-python -u scripts/01_crop_fields.py            # 약  8분
-python -u scripts/02_analyze_emergence.py       # 약 70분
-python -u scripts/03_postprocess_visualize.py   # 약  1분
-python -u scripts/04_detail_overlay.py          # 약  2분
+conda activate satelite
+python -u scripts/run_pipeline.py --field GJSM-1-1_Smart
 ```
 
-| 단계 | 스크립트 | 역할 | 입력 | 출력 |
-|---|---|---|---|---|
-| 0 | `emergence_lib.py` | 공통 알고리즘 모듈 (다른 스크립트가 import) | — | — |
-| 1 | `01_crop_fields.py` | 정사영상을 SHP로 마스크 클립 → 필지별 TIF | `data/`+`shapefile/` | `result/fields/{GJSM-X-Y}.tif` |
-| 2 | `02_analyze_emergence.py` | 필지별 입모율 본 분석 | `result/fields/` | `result/emergence/{GJSM-X-Y}_{plants,rows,gaps}.gpkg`, `{...}_rows.csv`, `emergence_summary.csv` |
-| 3 | `03_postprocess_visualize.py` | PPT용 종합 시각화 + GJSM-1-1 파종기 사선 분할 비교 | 2단계 산출 | `{GJSM-X-Y}_overview_ppt.png`, `GJSM-1-1_seeder_compare.png`, `GJSM-1-1_seeder_stats.csv` |
-| 4 | `04_detail_overlay.py` | 작은 영역 RGB 상세 오버레이 + 조간/주간 컬럼 추가 | 2·3단계 산출 | `{GJSM-X-Y}_detail.png`, `GJSM-1-1_detail_위/아래_*.png`, `emergence_summary.csv` 갱신, `seeder_stats.csv` 갱신 |
+`--skip-sam` 옵션: `result/sam_leaves/{field}_sam_FULL_v4.npz`가 이미 있으면 SAM 건너뛰고 step1부터.
 
-## 알고리즘 요약
+### 파종기 A/B 비교 리포트
 
-1. ExG (2g-r-b) 색지수 + 가우시안 detrend (조명 보정)
-2. Otsu+Sauvola 1차 이진화 (노이즈 허용 — 약한 새싹 보존)
-3. Radon transform 으로 두둑 각도 자동 검출
-4. 두둑방향 closing + size 필터 (잡노이즈 정리)
-5. 회전 후 1D 프로파일 → find_peaks → 두둑 라인
-6. 각 두둑 ±0.12m 밴드 → 라인 따라 1D 피크 → 개체 위치
-7. 인접 피크 간격 > 1.5×median → 결주 구간
-8. (GJSM-1-1) 식생 밀도 가장 낮은 사선 위치 자동 검출 → 파종기 경계
+```bash
+python -u scripts/pipeline/step5_seeder_compare.py \
+    GJSM-1-1_Smart GJSM-1-1_normal \
+    --labels "스마트 파종기,일반 파종기"
+```
 
-## 출력물 (최종)
+### 두 필지 처리 + 자동 비교
 
-### `result/fields/` (중간 산출, 다시 안 만들면 04 못 돌림)
-- `GJSM-{X-Y}.tif` × 5 — 필지별 RGBA 정사영상 (EPSG:32652, LZW 압축)
+```bash
+python -u scripts/run_pipeline.py \
+    --field GJSM-1-1_Smart --field GJSM-1-1_normal \
+    --skip-sam --then-compare \
+    --labels "스마트 파종기,일반 파종기"
+```
 
-### `result/emergence/` (최종)
+## 알고리즘
 
-**필지별 (5세트)**
-- `{GJSM-X-Y}_overview_ppt.png` — 4패널 PPT용 종합 시각화 (RGB, 두둑검출, 두둑별 입모율, 주간분포)
-- `{GJSM-X-Y}_detail.png` — 6m×5m 상세 RGB 오버레이 (노란선 두둑, 빨간원 개체, total=N lines=M 캡션)
-- `{GJSM-X-Y}_plants.gpkg` — 검출된 모든 개체 포인트
-- `{GJSM-X-Y}_rows.gpkg` — 두둑 중심선 (입모율/기대수 속성 포함)
-- `{GJSM-X-Y}_gaps.gpkg` — 결주 구간 라인스트링
-- `{GJSM-X-Y}_rows.csv` — 두둑별 통계 (개체수, 기대수, 입모율, 결주수)
+| 단계 | 신호 | 결과 |
+|---|---|---|
+| 1. 두둑 검출 | 필지 mask 내 gray weighted profile + SAM 밀도 → 반복주기 60~130cm bandpass → 각도 스캔 → 두둑 중심 1D peak | 두둑 중심선 + 두둑 방향 (각도) |
+| 2. 두둑별 dual-row | 두둑 밴드 내 gray 반전(파종 자국 어두운 홈) + SAM 밀도 결합 → sub-profile bandpass 5~90cm → top-2 peak | 파종 줄 2개 + 조간 |
+| 3. 줄 내 파종 간격 | SAM 잎 → 줄 밴드 내 8cm dedup(개체 병합) → ridge 방향 사영 → 인접 gap → median, CV, 결주(>30cm) | 줄별 median, mean, std, 결주 수, 입모율 |
+| 4. 시각화 | RGB + 파종 줄 + 잎 dot + 통계 | field_overview.png, ridge_grid_p*.png |
+| 5. 파종기 비교 | 필지 A/B의 median, 줄별 CV, 결주율, 입모율, 적합률 | seeder_comparison.png/csv/md |
 
-**필지 통합**
-- `emergence_summary.csv` — 5필지 통합 요약 + 조간/주간 컬럼
+## 표준 재배 제원
 
-**GJSM-1-1 파종기 비교**
-- `GJSM-1-1_seeder_compare.png` — 사선 분할 비교 시각화 + 통계 표
-- `GJSM-1-1_seeder_stats.csv` — zone별 통계 (조간/주간 포함)
-- `GJSM-1-1_detail_위_일반국내파종기.png` — 위 영역 상세
-- `GJSM-1-1_detail_아래_스마트파종기.png` — 아래 영역 상세
+- **주간(파종 간격)**: 20 cm (적합 ±5 cm → 15~25cm)
+- **조간(두둑 안 dual-row 간격)**: 30 cm(스마트) 또는 70 cm(일반)
+- **입모율**: 검출 잎 개체수 / 기대 개체수(=두둑 유효 길이 / 20cm) × 100
+- **결주 판정**: gap > 30cm (스펙 20cm × 1.5)
+- **파종 CV**: 줄별 std/mean × 100 → 여러 줄 CV의 median (낮을수록 균일)
 
-## 표준 재배 제원 (재단 가능, `emergence_lib.py`)
+## 검증 결과 (GJSM-1-1)
 
-- 조간 (1두둑 안 행간) = 30 cm  (적합 허용 ±7 cm)
-- 주간 (행 내 개체 간격) = 20 cm  (적합 허용 ±5 cm)
-- 입모율 = 검출개체수 / 기대개체수 × 100,  기대개체수 = 두둑유효길이 / 20cm
+| 지표 | 스마트 파종기 | 일반 파종기 |
+|---|---:|---:|
+| 파종 median | **22.0 cm** (스펙 20) | 29.6 cm |
+| 파종 CV (균일성) | **21.0%** | 27.9% |
+| 결주율 | **20.4%** | 46.3% |
+| 입모율 median | **67.6%** | 45.8% |
+| 적합 줄 비율 | **63.8%** | 2.1% |
+| 종합점수 | **74.6 / 100** | 45.5 / 100 |
+
+→ 모든 지표에서 스마트 파종기 우수.
